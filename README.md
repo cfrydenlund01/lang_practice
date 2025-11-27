@@ -52,6 +52,6 @@ Notes:
 ## Vocabulary data
 
 Core vocabulary for the French module lives in `lang_practice/languages/french/data.py`.
-Additional vocabulary can be seeded from `Supporting Docs/00.JSON.txt`, which now
-omits phonetic spellings so the pronunciation module can generate them automatically.
+Additional vocabulary can be seeded from `lang_practice/languages/french/Supporting Docs/00.JSON.txt`,
+which now omits phonetic spellings so the pronunciation module can generate them automatically.
 Update the language module files or sentence generator when adding new vocab or categories.
