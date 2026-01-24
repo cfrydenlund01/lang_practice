@@ -554,15 +554,7 @@ class ConjugationTab(ttk.Frame):
             self.verb_phonetic_var.set("")
 
         if pronoun:
-            pron_sources = {
-                "je": "je",
-                "tu": "tu",
-                "il/elle": "il",
-                "nous": "nous",
-                "vous": "vous",
-                "ils/elles": "ils",
-            }
-            base_pronoun = pron_sources.get(pronoun.lower(), pronoun)
+            base_pronoun = pronoun.split("/")[0].strip()
         else:
             base_pronoun = ""
 

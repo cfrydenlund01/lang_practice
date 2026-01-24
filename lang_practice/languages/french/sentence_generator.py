@@ -62,9 +62,9 @@ def _english_indef_article(word: str) -> str:
 def _choose_noun(category: str | None = None):
     from ...data import vocabulary_items
 
-    pool = vocabulary_items(part_of_speech="noun", category=category)
+    pool = vocabulary_items(part_of_speech="noun", category=category, language=LANGUAGE_KEY)
     if not pool:
-        pool = vocabulary_items(part_of_speech="noun")
+        pool = vocabulary_items(part_of_speech="noun", language=LANGUAGE_KEY)
     return choice(pool)
 
 

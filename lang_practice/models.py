@@ -61,7 +61,13 @@ class ConjugationPattern:
 
     @property
     def pronouns(self) -> Sequence[str]:
-        return ("je", "tu", "il/elle", "nous", "vous", "ils/elles")
+        pronouns_by_language: dict[str, Sequence[str]] = {
+            "french": ("je", "tu", "il/elle", "nous", "vous", "ils/elles"),
+            "italian": ("io", "tu", "lui/lei", "noi", "voi", "loro"),
+        }
+        if self.language and self.language in pronouns_by_language:
+            return pronouns_by_language[self.language]
+        return pronouns_by_language["french"]
 
     @property
     def answers(self) -> Sequence[str]:

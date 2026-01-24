@@ -2,7 +2,7 @@
 
 Modular Python application that provides a GUI for practicing vocabulary,
 sentences, pronunciation, and verb conjugations. Modules live under
-`lang_practice/languages/` (the current build ships with a French module) and
+`lang_practice/languages/` (the current build ships with French and Italian modules) and
 you can switch between them from the Language menu; the app remembers the last
 language you used.
 
@@ -51,7 +51,9 @@ Notes:
 
 ## Vocabulary data
 
-Core vocabulary for the French module lives in `lang_practice/languages/french/data.py`.
-Additional vocabulary can be seeded from `lang_practice/languages/french/Supporting Docs/00.JSON.txt`,
-which now omits phonetic spellings so the pronunciation module can generate them automatically.
+Core vocabulary lives inside each module's `data.py` file:
+
+- French: `lang_practice/languages/french/data.py`
+- Italian: `lang_practice/languages/italian/data.py`
+
 Update the language module files or sentence generator when adding new vocab or categories.

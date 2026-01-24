@@ -202,7 +202,7 @@ class ConjugationExercise:
     def next_prompt(self) -> tuple[str, str]:
         pattern = random_conjugation_pattern()
         self.current_pattern = pattern
-        self.current_index = pattern.pronouns.index("je")
+        self.current_index = 0
         return pattern.infinitive, pattern.pronouns[self.current_index]
 
     def cycle_prompt(self) -> tuple[str, str]:
