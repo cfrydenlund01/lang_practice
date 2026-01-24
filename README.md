@@ -20,8 +20,12 @@ language you used.
 Install Python dependencies (standard library + optional audio helpers) and launch the GUI:
 
 ```bash
-# Base requirements are standard library only
+# From the repo root (this folder), run the package as a module:
 python -m lang_practice
+
+# Note (Windows/PowerShell): these path-based invocations will fail:
+#   python -m .\lang_practice\
+#   python .\lang_practice\
 ```
 
 Use the tab bar to switch between flashcards, sentence practice, flip cards,
