@@ -4,12 +4,44 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from random import choice, random, shuffle
+import re
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
+import unicodedata
 
 from .data import random_conjugation_pattern, random_vocabulary_item, sentences, vocabulary_items
 from .language_registry import active_language_key
 from .models import ConjugationPattern, Sentence, VocabularyItem
 from .sentence_generator import generate_sentence
+
+
+def normalize_answer(value: str) -> str:
+    """Normalize harmless English-answer variation without weakening meaning."""
+
+    normalized = unicodedata.normalize("NFKC", value).casefold().strip()
+    normalized = normalized.replace("’", "'")
+    contractions = {
+        "i'm": "i am",
+        "you're": "you are",
+        "we're": "we are",
+        "they're": "they are",
+        "can't": "cannot",
+        "don't": "do not",
+        "doesn't": "does not",
+        "isn't": "is not",
+        "it's": "it is",
+    }
+    for short, expanded in contractions.items():
+        normalized = normalized.replace(short, expanded)
+    normalized = re.sub(r"[^\w\s]", " ", normalized)
+    words = [word for word in normalized.split() if word not in {"a", "an", "the"}]
+    return " ".join(words)
+
+
+def answer_matches(answer: str, expected: str, accepted_answers: Sequence[str] = ()) -> bool:
+    """Compare an answer with canonical and language-pack-approved variants."""
+
+    normalized_answer = normalize_answer(answer)
+    return any(normalized_answer == normalize_answer(option) for option in (expected, *accepted_answers))
 
 
 @dataclass
@@ -109,7 +141,7 @@ class FlashcardExercise:
         if self.current_item is None:
             self.next_prompt()
         assert self.current_item is not None  # for type checkers
-        correct = answer.strip().lower() == self.current_item.english.lower()
+        correct = answer_matches(answer, self.current_item.english, self.current_item.accepted_answers)
         self.state.register_attempt(correct)
         return correct
 

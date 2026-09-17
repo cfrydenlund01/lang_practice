@@ -34,16 +34,31 @@ def _format_article(article: str, word: str) -> str:
     return f"{article} {word}"
 
 
+def _uses_lo_article(word: str) -> bool:
+    """Return whether a masculine singular noun takes ``lo``/``uno``."""
+
+    normalized = word.lower()
+    return normalized.startswith(("z", "gn", "ps", "pn", "x", "y")) or (
+        normalized.startswith("s") and len(normalized) > 1 and normalized[1] not in VOWEL_STARTS
+    )
+
+
 def _definite_article_it(gender: str | None, word: str) -> str:
     if _starts_with_vowel(word):
         return "l'"
+    if gender == "m" and _uses_lo_article(word):
+        return "lo"
     if gender == "f":
         return "la"
     return "il"
 
 
-def _indefinite_article_it(gender: str | None) -> str:
-    return "una" if gender == "f" else "un"
+def _indefinite_article_it(gender: str | None, word: str) -> str:
+    if gender == "f":
+        return "un'" if _starts_with_vowel(word) else "una"
+    if _uses_lo_article(word):
+        return "uno"
+    return "un"
 
 
 def _english_indef_article(word: str) -> str:
@@ -62,25 +77,25 @@ def _choose_noun(category: str | None = None):
 def _sentence_io_vedo(category: str | None = None) -> Sentence:
     noun = _choose_noun(category)
     article = _definite_article_it(noun.gender, noun.french)
-    italian = f"Io vedo {_format_article(article, noun.french)}."
+    italian = f"Vedo {_format_article(article, noun.french)}."
     english = f"I see the {noun.english}."
     return Sentence(random_sentence_id("see"), italian, english, ("sentence_practice", "generated"), LANGUAGE_KEY)
 
 
 def _sentence_noi_abbiamo(category: str | None = None) -> Sentence:
     noun = _choose_noun(category)
-    article_it = _indefinite_article_it(noun.gender)
+    article_it = _indefinite_article_it(noun.gender, noun.french)
     article_en = _english_indef_article(noun.english)
-    italian = f"Noi abbiamo {article_it} {noun.french}."
+    italian = f"Noi abbiamo {_format_article(article_it, noun.french)}."
     english = f"We have {article_en} {noun.english}."
     return Sentence(random_sentence_id("have"), italian, english, ("sentence_practice", "generated"), LANGUAGE_KEY)
 
 
 def _sentence_c_e(category: str | None = None) -> Sentence:
     noun = _choose_noun(category)
-    article_it = _indefinite_article_it(noun.gender)
+    article_it = _indefinite_article_it(noun.gender, noun.french)
     article_en = _english_indef_article(noun.english)
-    italian = f"C'\u00e8 {article_it} {noun.french} qui."
+    italian = f"C'\u00e8 {_format_article(article_it, noun.french)} qui."
     english = f"There is {article_en} {noun.english} here."
     return Sentence(
         random_sentence_id("there_is"),
@@ -136,5 +151,18 @@ TEMPLATES: Sequence[TemplateBuilder] = (
 def generate_sentence(category: str | None = None) -> Sentence:
     """Generate a new practice sentence using vocabulary-driven templates."""
 
-    builder = choice(TEMPLATES)
+    from .data import SENTENCES
+
+    generatable_categories = {None, "all", "food", "home", "animals", "people", "travel", "city", "learning", "work"}
+    if category not in generatable_categories:
+        matching_sentences = [sentence for sentence in SENTENCES if category in sentence.tags]
+        if matching_sentences:
+            return choice(matching_sentences)
+
+    templates = list(TEMPLATES)
+    if category not in {None, "all", "animals", "home"}:
+        templates.remove(_sentence_animale_casa)
+    if category not in {None, "all", "food", "home"}:
+        templates.remove(_sentence_cibo_casa)
+    builder = choice(templates)
     return builder(category)

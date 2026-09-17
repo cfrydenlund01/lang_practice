@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..base import LanguageModule
+from .conjugation import explain_conjugation
 from .data import ACCENTED_CHARACTERS, LANGUAGE_KEY, PRESENT_TENSE, SENTENCES, VOCABULARY
 from .pronunciation import explain_pronunciation, to_ipa, to_phonetic
 from .sentence_generator import generate_sentence
@@ -16,10 +17,10 @@ MODULE = LanguageModule(
     present_tense=PRESENT_TENSE,
     sentences=SENTENCES,
     explain_pronunciation=explain_pronunciation,
+    explain_conjugation=explain_conjugation,
     to_ipa=to_ipa,
     to_phonetic=to_phonetic,
     generate_sentence=generate_sentence,
 )
 
 __all__ = ["MODULE"]
-

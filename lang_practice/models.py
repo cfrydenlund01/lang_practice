@@ -24,6 +24,7 @@ class VocabularyItem:
     part_of_speech: str = "noun"
     tags: Sequence[str] = ()
     language: str | None = None
+    accepted_answers: Sequence[str] = ()
 
     @property
     def ipa(self) -> str:
@@ -88,6 +89,7 @@ class Sentence:
     english: str
     tags: Sequence[str] = ()
     language: str | None = None
+    accepted_answers: Sequence[str] = ()
 
     @property
     def ipa(self) -> str:

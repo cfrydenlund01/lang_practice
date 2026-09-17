@@ -23,6 +23,7 @@ class LanguageModule:
     present_tense: Sequence[ConjugationPattern]
     sentences: Sequence[Sentence]
     explain_pronunciation: Callable[[str], str]
+    explain_conjugation: Callable[[ConjugationPattern], str]
     to_ipa: Callable[[str], str]
     to_phonetic: Callable[[str], str]
     generate_sentence: SentenceGenerator
