@@ -1,4 +1,4 @@
-"""French language module wiring."""
+"""Italian language module wiring."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from .sentence_generator import generate_sentence
 
 MODULE = LanguageModule(
     key=LANGUAGE_KEY,
-    label="French",
-    tts_lang="fr",
+    label="Italian",
+    tts_lang="it",
     accent_characters=ACCENTED_CHARACTERS,
     vocabulary=VOCABULARY,
     present_tense=PRESENT_TENSE,
