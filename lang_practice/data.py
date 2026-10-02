@@ -69,3 +69,9 @@ def random_conjugation_pattern(language: str | None = None) -> ConjugationPatter
 def sentences(language: str | None = None) -> Sequence[Sentence]:
     module = get_module(language)
     return module.sentences
+
+
+def guided_sentences(language: str | None = None) -> Sequence[Sentence]:
+    """Return only authored sentences with validated readiness metadata."""
+
+    return tuple(sentence for sentence in sentences(language) if sentence.guided_ready)

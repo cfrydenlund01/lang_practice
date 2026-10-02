@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import threading
 import time
@@ -12,6 +13,7 @@ from tkinter import messagebox, ttk
 from dataclasses import dataclass, field
 from random import sample
 from typing import Callable
+from uuid import uuid4
 
 from .audio import play_audio
 from .data import accented_characters, categories, present_tense_patterns, sentences, vocabulary_items
@@ -21,13 +23,23 @@ from .exercises import (
     FlashcardExercise,
     FlipCardExercise,
     SentencePracticeExercise,
+    PromptAttemptState,
     answer_matches,
     build_exercise_registry,
 )
 from .language_registry import active_language_key, available_modules, get_active_module, set_active_module
-from .models import VocabularyItem
+from .models import AttemptEvent, AttemptResolution, ReadinessSnapshot, Sentence, VocabularyItem
 from .pronunciation import explain_pronunciation, to_ipa, to_phonetic
 from .review_db import ReviewDB, ReviewItem
+from .sentence_readiness import (
+    SUPPORT_LEVELS,
+    SessionTargetEvidence,
+    TargetKey,
+    recommend_sentence_support,
+    sentence_target_keys,
+    support_scaffold,
+    targeted_sentence_feedback,
+)
 from .tts_client import available as tts_client_available, synthesize_to_file
 
 _tts_flag = os.getenv("LANG_PRACTICE_TTS_ENABLED", os.getenv("FRENCH_TTS_ENABLED", "1"))
@@ -401,12 +413,12 @@ class FlashcardTab(KeyboardNavigableTab):
         self,
         master: tk.Misc,
         exercise: FlashcardExercise,
-        on_attempt: Callable[[bool, str | None, str | None, str | None], None],
+        on_resolution: Callable[[AttemptResolution], None],
         help_panel: PronunciationHelpPanel | None = None,
     ) -> None:
         super().__init__(master, padding=12)
         self.exercise = exercise
-        self._on_attempt = on_attempt
+        self._on_resolution = on_resolution
         self._help_panel = help_panel
         self.prompt_var = tk.StringVar(value="Press Next to start")
         self.ipa_var = tk.StringVar()
@@ -414,9 +426,11 @@ class FlashcardTab(KeyboardNavigableTab):
         self.feedback_var = tk.StringVar()
         self.answer_var = tk.StringVar()
         self.category_var = tk.StringVar(value="all")
+        self.direction_var = tk.StringVar(value="Target → English")
 
         self._build()
-        self._revealed_this_item = False
+        self._attempt_state = PromptAttemptState()
+        self._prompt_direction = self._direction()
 
     def _build(self) -> None:
         ttk.Label(self, text="Category:").grid(row=0, column=0, sticky="w")
@@ -424,13 +438,22 @@ class FlashcardTab(KeyboardNavigableTab):
         ttk.OptionMenu(self, self.category_var, self.category_var.get(), *cat_values, command=self._change_category).grid(
             row=0, column=1, sticky="w"
         )
+        ttk.Label(self, text="Practice:").grid(row=0, column=2, sticky="e")
+        ttk.OptionMenu(
+            self,
+            self.direction_var,
+            self.direction_var.get(),
+            "Target → English",
+            "English → target",
+            command=lambda _value: self._refresh_direction(),
+        ).grid(row=0, column=3, sticky="w")
 
         ttk.Label(self, textvariable=self.prompt_var, font=("Helvetica", 16, "bold")).grid(
-            row=1, column=0, columnspan=2, pady=(12, 4), sticky="w"
+            row=1, column=0, columnspan=3, pady=(12, 4), sticky="w"
         )
         listen_state = tk.NORMAL if tts_available() else tk.DISABLED
         listen_frame = ttk.Frame(self)
-        listen_frame.grid(row=1, column=2, sticky="ne")
+        listen_frame.grid(row=1, column=3, sticky="ne")
         self.listen_button = ttk.Button(listen_frame, text="Listen", command=self._play_audio, state=listen_state)
         self.listen_button.grid(
             row=0, column=0, sticky="ew"
@@ -439,22 +462,26 @@ class FlashcardTab(KeyboardNavigableTab):
         self.listen_indicator = TTSStatusIndicator(listen_frame)
         self.listen_indicator.grid(row=1, column=0, sticky="ew", pady=(2, 0))
         ttk.Label(self, textvariable=self.ipa_var, font=("Helvetica", 12, "italic"), foreground="gray25").grid(
-            row=2, column=0, columnspan=3, sticky="w"
+            row=2, column=0, columnspan=4, sticky="w"
         )
         ttk.Label(self, textvariable=self.phonetic_var, font=("Helvetica", 12), foreground="gray35").grid(
-            row=3, column=0, columnspan=3, sticky="w"
+            row=3, column=0, columnspan=4, sticky="w"
         )
 
         answer_entry = ttk.Entry(self, textvariable=self.answer_var, width=30)
-        answer_entry.grid(row=4, column=0, columnspan=2, pady=4, sticky="we")
-        AccentToolbar(self, answer_entry).grid(row=5, column=0, columnspan=2, sticky="w")
+        answer_entry.grid(row=4, column=0, columnspan=3, pady=4, sticky="we")
+        AccentToolbar(self, answer_entry).grid(row=5, column=0, columnspan=3, sticky="w")
 
         button_frame = ttk.Frame(self)
-        button_frame.grid(row=4, column=2, rowspan=2, padx=(8, 0), sticky="ns")
+        button_frame.grid(row=4, column=3, rowspan=2, padx=(8, 0), sticky="ns")
         self.check_button = ttk.Button(button_frame, text="Check", command=self._check_answer)
         self.check_button.pack(fill=tk.X, pady=2)
         self.reveal_button = ttk.Button(button_frame, text="Reveal", command=self._reveal_answer)
         self.reveal_button.pack(fill=tk.X, pady=2)
+        self.hint_button = ttk.Button(button_frame, text="Hint", command=self._show_hint)
+        self.hint_button.pack(fill=tk.X, pady=2)
+        self.skip_button = ttk.Button(button_frame, text="Skip", command=self._skip)
+        self.skip_button.pack(fill=tk.X, pady=2)
         self.prev_button = ttk.Button(button_frame, text="Previous", command=self._previous, state=tk.DISABLED)
         self.prev_button.pack(fill=tk.X, pady=2)
         self.next_button = ttk.Button(button_frame, text="Next", command=self._next)
@@ -462,29 +489,40 @@ class FlashcardTab(KeyboardNavigableTab):
 
         self.set_default_button(self.check_button)
         self.register_action_buttons(
-            [self.listen_button, self.check_button, self.reveal_button, self.prev_button, self.next_button]
+            [self.listen_button, self.check_button, self.reveal_button, self.hint_button, self.skip_button, self.prev_button, self.next_button]
         )
         self.update_enter_target(None)
 
         ttk.Label(self, textvariable=self.feedback_var, foreground="steelblue").grid(
-            row=6, column=0, columnspan=3, pady=(8, 0), sticky="w"
+            row=6, column=0, columnspan=4, pady=(8, 0), sticky="w"
         )
 
         self.stats = StatsBar(self)
-        self.stats.grid(row=7, column=0, columnspan=3, sticky="we", pady=(12, 0))
+        self.stats.grid(row=7, column=0, columnspan=4, sticky="we", pady=(12, 0))
 
-        for i in range(3):
+        for i in range(4):
             self.columnconfigure(i, weight=1)
 
     def _change_category(self, category: str) -> None:
+        self._resolve_unfinished_miss()
         self.exercise.set_category(category)
         self._next()
 
+    def _refresh_direction(self) -> None:
+        self._resolve_unfinished_miss()
+        if self.exercise.current_item:
+            self._display_item(self.exercise.current_item)
+
+    def _direction(self) -> str:
+        return "english_to_target" if self.direction_var.get() == "English → target" else "target_to_english"
+
     def _next(self) -> None:
+        self._resolve_unfinished_miss()
         item = self.exercise.next_prompt()
         self._display_item(item)
 
     def _previous(self) -> None:
+        self._resolve_unfinished_miss()
         item = self.exercise.previous_prompt()
         if item is None:
             self.feedback_var.set("No previous card available.")
@@ -493,11 +531,15 @@ class FlashcardTab(KeyboardNavigableTab):
         self._display_item(item)
 
     def _display_item(self, item: VocabularyItem) -> None:
-        self.prompt_var.set(f"Translate: {item.french}")
+        self._prompt_direction = self._direction()
+        if self._prompt_direction == "english_to_target":
+            self.prompt_var.set(f"Translate to {language_label()}: {item.english}")
+        else:
+            self.prompt_var.set(f"Translate: {item.french}")
         self._update_pronunciation(item)
         self.answer_var.set("")
         self.feedback_var.set("")
-        self._revealed_this_item = False
+        self._attempt_state = PromptAttemptState()
         self._update_previous_state()
         self._update_help(item.french)
 
@@ -510,28 +552,68 @@ class FlashcardTab(KeyboardNavigableTab):
             self.feedback_var.set("Type your answer first.")
             return
         answer = self.answer_var.get()
-        correct = self.exercise.check_answer(answer)
+        if self._direction() == "english_to_target":
+            current = self.exercise.current_item
+            correct = bool(current and answer_matches(answer, current.french, current.accepted_answers))
+            self.exercise.state.register_attempt(correct)
+        else:
+            correct = self.exercise.check_answer(answer)
         current = self.exercise.current_item
         if current:
-            prompt = current.french
-            correct_answer = current.english
-            self._on_attempt(correct, prompt, correct_answer, answer)
+            self._attempt_state.note_answer(answer, correct)
+            if correct:
+                self._emit_resolution(current, "correct", answer)
         if correct:
             self.feedback_var.set("Correct! 🎉")
             self._next()
         else:
             assert self.exercise.current_item is not None
-            self.feedback_var.set(f"Not quite. Answer: {self.exercise.current_item.english}")
+            self.feedback_var.set(f"Not quite. Try again, reveal the answer, or use Hint for the pronunciation guide.")
         self._refresh_stats()
 
     def _reveal_answer(self) -> None:
         if self.exercise.current_item:
-            self.feedback_var.set(f"Answer: {self.exercise.current_item.english}")
-            self._update_pronunciation(self.exercise.current_item)
-            if not self._revealed_this_item:
-                item = self.exercise.current_item
-                self._on_attempt(False, item.french, item.english, "")
-                self._revealed_this_item = True
+            item = self.exercise.current_item
+            answer = item.french if self._direction() == "english_to_target" else item.english
+            self.feedback_var.set(f"Answer: {answer}. The pronunciation guide is open at right.")
+            self._update_pronunciation(item)
+            self._attempt_state.mark_support("reveal")
+            self._emit_resolution(item, "skipped", self.answer_var.get())
+
+    def _show_hint(self) -> None:
+        item = self.exercise.current_item
+        if not item:
+            return
+        self._attempt_state.mark_support("hint")
+        self._update_help(item.french)
+        self.feedback_var.set("Hint shown in the pronunciation guide. Your next answer will be recorded as helped.")
+
+    def _skip(self) -> None:
+        item = self.exercise.current_item
+        if item:
+            self._emit_resolution(item, "skipped", self.answer_var.get())
+            self.feedback_var.set("Skipped. The target remains available for review.")
+            self._next()
+
+    def _resolve_unfinished_miss(self) -> None:
+        item = self.exercise.current_item
+        if item and self._attempt_state.answer_count:
+            self._emit_resolution(item, "incorrect", self._attempt_state.last_answer)
+
+    def _emit_resolution(self, item: VocabularyItem, outcome: str, answer: str | None) -> None:
+        evidence = self._attempt_state.resolve(outcome, answer)
+        if evidence is None:
+            return
+        first_try, support_used, first_try_correct, final_answer = evidence
+        direction = self._prompt_direction
+        prompt = item.english if direction == "english_to_target" else item.french
+        correct_answer = item.french if direction == "english_to_target" else item.english
+        self._on_resolution(AttemptResolution(
+            language=item.language or active_language_key(), exercise_id="flashcard",
+            skill="vocabulary", direction=direction, item_id=item.id, outcome=outcome,
+            first_try=first_try, support_used=support_used, answer=final_answer,
+            first_try_correct=first_try_correct, prompt=prompt, correct_answer=correct_answer,
+        ))
 
     def _refresh_stats(self) -> None:
         state = self.exercise.state
@@ -564,12 +646,12 @@ class ConjugationTab(KeyboardNavigableTab):
         self,
         master: tk.Misc,
         exercise: ConjugationExercise,
-        on_attempt: Callable[[bool, str | None, str | None, str | None], None],
+        on_resolution: Callable[[AttemptResolution], None],
         help_panel: PronunciationHelpPanel | None = None,
     ) -> None:
         super().__init__(master, padding=12)
         self.exercise = exercise
-        self._on_attempt = on_attempt
+        self._on_resolution = on_resolution
         self._help_panel = help_panel
         self._tts_enabled = tts_available()
         self._answer_audio_ready = False
@@ -589,7 +671,7 @@ class ConjugationTab(KeyboardNavigableTab):
         self.feedback_var = tk.StringVar(value="")
         self.answer_var = tk.StringVar(value="")
         self._build()
-        self._attempted_current_prompt = False
+        self._attempt_state = PromptAttemptState()
 
     def _build(self) -> None:
         ttk.Label(self, textvariable=self.title_var, font=("Helvetica", 18, "bold")).grid(
@@ -684,6 +766,8 @@ class ConjugationTab(KeyboardNavigableTab):
         self.check_button.pack(side=tk.LEFT, padx=(0, 6))
         self.show_answer_button = ttk.Button(button_frame, text="Show answer", command=self._show_answer, state=tk.DISABLED)
         self.show_answer_button.pack(side=tk.LEFT, padx=(0, 6))
+        self.skip_button = ttk.Button(button_frame, text="Skip", command=self._skip, state=tk.DISABLED)
+        self.skip_button.pack(side=tk.LEFT, padx=(0, 6))
         self.previous_pronoun_button = ttk.Button(button_frame, text="Previous pronoun", command=self._previous_pronoun, state=tk.DISABLED)
         self.previous_pronoun_button.pack(side=tk.LEFT, padx=(0, 6))
         self.next_pronoun_button = ttk.Button(button_frame, text="Next pronoun", command=self._cycle_pronoun, state=tk.DISABLED)
@@ -698,6 +782,7 @@ class ConjugationTab(KeyboardNavigableTab):
                 self.listen_answer_button,
                 self.check_button,
                 self.show_answer_button,
+                self.skip_button,
                 self.previous_pronoun_button,
                 self.next_pronoun_button,
                 self.next_button,
@@ -723,6 +808,7 @@ class ConjugationTab(KeyboardNavigableTab):
         for button in (
             self.check_button,
             self.show_answer_button,
+            self.skip_button,
             self.previous_pronoun_button,
             self.next_pronoun_button,
             self.lesson_button,
@@ -731,10 +817,12 @@ class ConjugationTab(KeyboardNavigableTab):
         self._next()
 
     def _next(self) -> None:
+        self._resolve_unfinished_miss()
         verb, pronoun = self.exercise.next_prompt()
         self._update_prompt(verb, pronoun)
 
     def _cycle_pronoun(self) -> None:
+        self._resolve_unfinished_miss()
         verb, pronoun = self.exercise.cycle_prompt()
         self._update_prompt(verb, pronoun)
 
@@ -769,7 +857,7 @@ class ConjugationTab(KeyboardNavigableTab):
         self.answer_var.set("")
         self.feedback_var.set("")
         self._answer_audio_ready = False
-        self._attempted_current_prompt = False
+        self._attempt_state = PromptAttemptState()
         self._refresh_audio_states()
 
     def _pronoun_hints(self) -> dict[str, str]:
@@ -818,6 +906,8 @@ class ConjugationTab(KeyboardNavigableTab):
         self._show_hidden_lesson_state()
 
     def _toggle_lesson(self) -> None:
+        if self.exercise.current_pattern:
+            self._attempt_state.mark_support("hint")
         self._show_lesson(not self._lesson_visible)
 
     def _show_lesson(self, visible: bool) -> None:
@@ -839,6 +929,7 @@ class ConjugationTab(KeyboardNavigableTab):
         self.instructions_label.configure(wraplength=width)
 
     def _previous_pronoun(self) -> None:
+        self._resolve_unfinished_miss()
         verb, pronoun = self.exercise.previous_prompt()
         self._update_prompt(verb, pronoun)
 
@@ -850,13 +941,16 @@ class ConjugationTab(KeyboardNavigableTab):
         correct = self.exercise.check_answer(answer)
         full_answer = self._current_full_answer()
         if full_answer:
-            prompt = self.phrase_var.get().strip() or self.verb_var.get().strip()
-            self._on_attempt(correct, prompt, full_answer, answer)
-            self._attempted_current_prompt = True
+            self._attempt_state.note_answer(answer, correct)
+            if correct:
+                self._emit_resolution("correct", answer)
         if correct:
             message = f"Correct: {full_answer}" if full_answer else "Correct!"
         else:
-            message = f"Not quite. Correct answer: {full_answer}" if full_answer else "Not quite. Try again."
+            message = (
+                f"Not quite. Try again, show the answer, or open the lesson for {self.exercise.current_pattern.infinitive}."
+                if full_answer and self.exercise.current_pattern else "Not quite. Try again."
+            )
         self.feedback_var.set(message)
         self._answer_audio_ready = True
         self._refresh_audio_states()
@@ -882,14 +976,45 @@ class ConjugationTab(KeyboardNavigableTab):
         full_answer = self._current_full_answer()
         if full_answer:
             self.feedback_var.set(f"Answer: {full_answer}")
-            if not self._attempted_current_prompt:
-                prompt = self.phrase_var.get().strip() or self.verb_var.get().strip()
-                self._on_attempt(False, prompt, full_answer, self.answer_var.get())
-                self._attempted_current_prompt = True
+            self._attempt_state.mark_support("reveal")
+            self._emit_resolution("skipped", self.answer_var.get())
         else:
             self.feedback_var.set("Answer unavailable.")
         self._answer_audio_ready = True
         self._refresh_audio_states()
+
+    def _skip(self) -> None:
+        if self.exercise.current_pattern is None:
+            return
+        self._emit_resolution("skipped", self.answer_var.get())
+        self.feedback_var.set("Skipped. This verb form remains available for review.")
+        self._cycle_pronoun()
+
+    def _resolve_unfinished_miss(self) -> None:
+        if self.exercise.current_pattern and self._attempt_state.answer_count:
+            self._emit_resolution("incorrect", self._attempt_state.last_answer)
+
+    def _emit_resolution(self, outcome: str, answer: str | None) -> None:
+        pattern = self.exercise.current_pattern
+        full_answer = self._current_full_answer()
+        if pattern is None or full_answer is None:
+            return
+        evidence = self._attempt_state.resolve(outcome, answer)
+        if evidence is None:
+            return
+        person = (
+            "first_singular", "second_singular", "third_singular",
+            "first_plural", "second_plural", "third_plural",
+        )[self.exercise.current_index]
+        first_try, support_used, first_try_correct, final_answer = evidence
+        self._on_resolution(AttemptResolution(
+            language=pattern.language or active_language_key(), exercise_id="conjugation",
+            skill="verb_form", direction="target_form", item_id=pattern.form_id(person),
+            outcome=outcome, first_try=first_try, support_used=support_used,
+            answer=final_answer, first_try_correct=first_try_correct,
+            prompt=self.phrase_var.get().strip() or pattern.infinitive,
+            correct_answer=full_answer,
+        ))
 
     def _refresh_stats(self) -> None:
         state = self.exercise.state
@@ -968,13 +1093,15 @@ class SentencePracticeTab(KeyboardNavigableTab):
         self,
         master: tk.Misc,
         exercise: SentencePracticeExercise,
-        on_attempt: Callable[[bool, str | None, str | None, str | None], None],
+        on_resolution: Callable[[AttemptResolution], None],
         help_panel: PronunciationHelpPanel | None = None,
+        readiness_provider: Callable[[Sentence], dict[TargetKey, ReadinessSnapshot]] | None = None,
     ) -> None:
         super().__init__(master, padding=12)
         self.exercise = exercise
-        self._on_attempt = on_attempt
+        self._on_resolution = on_resolution
         self._help_panel = help_panel
+        self._readiness_provider = readiness_provider
         self.category_var = tk.StringVar(value="all")
         self.use_generator_var = tk.BooleanVar(value=self.exercise.use_generator)
         self.sentence_var = tk.StringVar(value="Click New Sentence to begin")
@@ -982,10 +1109,15 @@ class SentencePracticeTab(KeyboardNavigableTab):
         self.phonetic_var = tk.StringVar()
         self.translation_var = tk.StringVar(value="Translation hidden")
         self.feedback_var = tk.StringVar(value="")
+        self.support_choice_var = tk.StringVar(value="Recommended")
+        self.readiness_var = tk.StringVar(value="")
+        self.scaffold_var = tk.StringVar(value="")
         self.answer_var = tk.StringVar(value="")
         self._current_translation = ""
         self._current_prompt = ""
-        self._revealed_current = False
+        self._attempt_state = PromptAttemptState()
+        self._session_target_evidence: dict[TargetKey, SessionTargetEvidence] = {}
+        self._current_snapshots: dict[TargetKey, ReadinessSnapshot] = {}
         self._history = []
         self._history_index = -1
 
@@ -1034,6 +1166,10 @@ class SentencePracticeTab(KeyboardNavigableTab):
             button_frame, text="Reveal", command=self._reveal_translation, state=tk.DISABLED
         )
         self.reveal_button.pack(fill=tk.X, pady=2)
+        self.hint_button = ttk.Button(button_frame, text="Hint", command=self._show_hint, state=tk.DISABLED)
+        self.hint_button.pack(fill=tk.X, pady=2)
+        self.skip_button = ttk.Button(button_frame, text="Skip", command=self._skip, state=tk.DISABLED)
+        self.skip_button.pack(fill=tk.X, pady=2)
         self.prev_button = ttk.Button(button_frame, text="Previous", command=self._previous_sentence, state=tk.DISABLED)
         self.prev_button.pack(fill=tk.X, pady=2)
         self.next_button = ttk.Button(button_frame, text="New Sentence", command=self._next_sentence)
@@ -1046,9 +1182,25 @@ class SentencePracticeTab(KeyboardNavigableTab):
             row=6, column=0, columnspan=3, sticky="w", pady=(8, 0)
         )
 
+        support_frame = ttk.Frame(self)
+        support_frame.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        ttk.Label(support_frame, text="Sentence support:").pack(side=tk.LEFT)
+        ttk.OptionMenu(
+            support_frame,
+            self.support_choice_var,
+            self.support_choice_var.get(),
+            "Recommended",
+            *SUPPORT_LEVELS,
+            command=self._change_support_level,
+        ).pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(support_frame, textvariable=self.readiness_var, foreground="slateblue").pack(side=tk.LEFT)
+        ttk.Label(self, textvariable=self.scaffold_var, wraplength=720, justify=tk.LEFT).grid(
+            row=8, column=0, columnspan=3, sticky="w", pady=(4, 0)
+        )
+
         self.set_default_button(self.check_button)
         self.register_action_buttons(
-            [self.listen_button, self.check_button, self.reveal_button, self.prev_button, self.next_button]
+            [self.listen_button, self.check_button, self.reveal_button, self.hint_button, self.skip_button, self.prev_button, self.next_button]
         )
         self.update_enter_target(None)
 
@@ -1056,6 +1208,7 @@ class SentencePracticeTab(KeyboardNavigableTab):
             self.columnconfigure(i, weight=1)
 
     def _change_category(self, category: str) -> None:
+        self._resolve_unfinished_miss()
         self.exercise.set_category(category)
         self._reset_history()
         self._next_sentence()
@@ -1064,6 +1217,7 @@ class SentencePracticeTab(KeyboardNavigableTab):
         self.exercise.use_generator = self.use_generator_var.get()
 
     def _next_sentence(self) -> None:
+        self._resolve_unfinished_miss()
         if self._history_index < len(self._history) - 1:
             self._history_index += 1
             sentence = self._history[self._history_index]
@@ -1074,6 +1228,7 @@ class SentencePracticeTab(KeyboardNavigableTab):
         self._load_sentence(sentence)
 
     def _previous_sentence(self) -> None:
+        self._resolve_unfinished_miss()
         if self._history_index <= 0:
             return
         self._history_index -= 1
@@ -1081,6 +1236,7 @@ class SentencePracticeTab(KeyboardNavigableTab):
         self._load_sentence(sentence)
 
     def _load_sentence(self, sentence) -> None:
+        self.exercise.current_sentence = sentence
         self._current_prompt = sentence.french
         self.sentence_var.set(sentence.french)
         self.ipa_var.set(sentence.ipa)
@@ -1089,9 +1245,12 @@ class SentencePracticeTab(KeyboardNavigableTab):
         self.translation_var.set("Translation hidden")
         self.feedback_var.set("")
         self.answer_var.set("")
-        self._revealed_current = False
+        self._attempt_state = PromptAttemptState()
+        self._refresh_readiness(sentence)
         self.check_button.state(["!disabled"])
         self.reveal_button.state(["!disabled"])
+        self.hint_button.state(["!disabled"])
+        self.skip_button.state(["!disabled"])
         if self._history_index > 0:
             self.prev_button.state(["!disabled"])
         else:
@@ -1100,6 +1259,36 @@ class SentencePracticeTab(KeyboardNavigableTab):
         if self._help_panel:
             explanation = explain_pronunciation(sentence.french)
             self._help_panel.set_text(explanation)
+
+    def _change_support_level(self, _selection: str) -> None:
+        sentence = self.exercise.current_sentence
+        if sentence:
+            self._refresh_readiness(sentence)
+
+    def _refresh_readiness(self, sentence: Sentence) -> None:
+        if not sentence.guided_ready:
+            self._current_snapshots = {}
+            self.readiness_var.set("Direct browsing: generated or untagged sentence")
+            self.scaffold_var.set("Guided readiness is available only for validated, authored sentences.")
+            return
+        snapshots = self._readiness_provider(sentence) if self._readiness_provider else {}
+        self._current_snapshots = snapshots
+        selected = self.support_choice_var.get()
+        readiness = recommend_sentence_support(
+            sentence,
+            snapshots,
+            self._session_target_evidence,
+            None if selected == "Recommended" else selected,
+        )
+        self.readiness_var.set(
+            f"Recommended: {readiness.recommended_level} · Showing: {readiness.presentation_level}"
+        )
+        self.scaffold_var.set(support_scaffold(sentence, readiness.presentation_level))
+        # A visible scaffold is real help, even when it was recommended rather
+        # than explicitly requested. Preserve that distinction in the eventual
+        # sentence event instead of counting a scaffolded answer as unaided.
+        if readiness.presentation_level != "Independent":
+            self._attempt_state.mark_support("hint")
 
     def _reset_history(self) -> None:
         self._history = []
@@ -1111,15 +1300,17 @@ class SentencePracticeTab(KeyboardNavigableTab):
         self.answer_var.set("")
         self.check_button.state(["disabled"])
         self.reveal_button.state(["disabled"])
+        self.hint_button.state(["disabled"])
+        self.skip_button.state(["disabled"])
         self.prev_button.state(["disabled"])
         self.update_enter_target(self.focus_get())
 
     def _reveal_translation(self) -> None:
         if self._current_translation:
             self.translation_var.set(f"Translation: {self._current_translation}")
-            if not self._revealed_current and self._current_prompt:
-                self._on_attempt(False, self._current_prompt, self._current_translation, self.answer_var.get())
-                self._revealed_current = True
+            self._attempt_state.mark_support("reveal")
+            self._emit_resolution("skipped", self.answer_var.get())
+            self.feedback_var.set("Translation revealed. The pronunciation guide can help with the target sentence.")
 
     def _check_answer(self) -> None:
         if not self._current_translation or not self._current_prompt:
@@ -1129,13 +1320,83 @@ class SentencePracticeTab(KeyboardNavigableTab):
         if not answer.strip():
             self.feedback_var.set("Type your answer first.")
             return
-        correct = answer_matches(answer, self._current_translation)
-        self._on_attempt(correct, self._current_prompt, self._current_translation, answer)
+        sentence = self.exercise.current_sentence
+        accepted_answers = sentence.accepted_answers if sentence else ()
+        correct = answer_matches(answer, self._current_translation, accepted_answers)
+        self._attempt_state.note_answer(answer, correct)
+        if correct:
+            self._emit_resolution("correct", answer)
         if correct:
             self.feedback_var.set("Correct!")
             self._next_sentence()
         else:
-            self.feedback_var.set(f"Not quite. Answer: {self._current_translation}")
+            sentence = self.exercise.current_sentence
+            if sentence and sentence.guided_ready:
+                feedback = targeted_sentence_feedback(sentence, answer, self._current_snapshots)
+                self.feedback_var.set(feedback.message)
+                self._record_session_target(feedback.target_key, missed=True)
+                if self._help_panel and feedback.lesson:
+                    self._help_panel.set_content("Targeted sentence lesson", feedback.lesson)
+                self._refresh_readiness(sentence)
+            else:
+                self.feedback_var.set("Not quite. Try again, reveal it, or use Hint for the pronunciation guide.")
+
+    def _show_hint(self) -> None:
+        sentence = self.exercise.current_sentence
+        if not sentence:
+            return
+        self._attempt_state.mark_support("hint")
+        if sentence.guided_ready:
+            feedback = targeted_sentence_feedback(sentence, self.answer_var.get(), self._current_snapshots)
+            self._record_session_target(feedback.target_key, helped=True)
+            if self._help_panel:
+                self._help_panel.set_content("Targeted sentence lesson", feedback.lesson)
+            self.feedback_var.set(
+                f"Hint: {feedback.message} Your next answer will be recorded as helped."
+            )
+            self._refresh_readiness(sentence)
+        else:
+            if self._help_panel:
+                self._help_panel.set_text(explain_pronunciation(sentence.french))
+            self.feedback_var.set("Hint shown in the pronunciation guide. Your next answer will be recorded as helped.")
+
+    def _record_session_target(
+        self, target_key: TargetKey | None, *, missed: bool = False, helped: bool = False
+    ) -> None:
+        if target_key is None:
+            return
+        current = self._session_target_evidence.get(target_key, SessionTargetEvidence())
+        self._session_target_evidence[target_key] = SessionTargetEvidence(
+            misses=current.misses + int(missed),
+            help_uses=current.help_uses + int(helped),
+        )
+
+    def _skip(self) -> None:
+        if not self.exercise.current_sentence:
+            return
+        self._emit_resolution("skipped", self.answer_var.get())
+        self.feedback_var.set("Skipped. This sentence remains available for review.")
+        self._next_sentence()
+
+    def _resolve_unfinished_miss(self) -> None:
+        if self.exercise.current_sentence and self._attempt_state.answer_count:
+            self._emit_resolution("incorrect", self._attempt_state.last_answer)
+
+    def _emit_resolution(self, outcome: str, answer: str | None) -> None:
+        sentence = self.exercise.current_sentence
+        if sentence is None:
+            return
+        evidence = self._attempt_state.resolve(outcome, answer)
+        if evidence is None:
+            return
+        first_try, support_used, first_try_correct, final_answer = evidence
+        self._on_resolution(AttemptResolution(
+            language=sentence.language or active_language_key(), exercise_id="sentence",
+            skill="sentence_translation", direction="target_to_english", item_id=sentence.id,
+            outcome=outcome, first_try=first_try, support_used=support_used,
+            answer=final_answer, first_try_correct=first_try_correct,
+            prompt=sentence.french, correct_answer=sentence.english,
+        ))
 
     def _listen_sentence(self) -> None:
         text = self.sentence_var.get()
@@ -1150,12 +1411,12 @@ class FlipCardTab(KeyboardNavigableTab):
         self,
         master: tk.Misc,
         exercise: FlipCardExercise,
-        on_attempt: Callable[[bool, str | None, str | None, str | None], None],
+        on_resolution: Callable[[AttemptResolution], None],
         help_panel: PronunciationHelpPanel | None = None,
     ) -> None:
         super().__init__(master, padding=12)
         self.exercise = exercise
-        self._on_attempt = on_attempt
+        self._on_resolution = on_resolution
         self._help_panel = help_panel
         self.category_var = tk.StringVar(value="all")
         self.language_label = language_label()
@@ -1164,6 +1425,7 @@ class FlipCardTab(KeyboardNavigableTab):
         self.translation_var = tk.StringVar()
         self.ipa_var = tk.StringVar()
         self.phonetic_var = tk.StringVar()
+        self._attempt_state = PromptAttemptState()
 
         self._build()
 
@@ -1246,10 +1508,12 @@ class FlipCardTab(KeyboardNavigableTab):
             self.phonetic_var.set("")
             return
         self._update_view(card)
+        self._attempt_state = PromptAttemptState()
 
     def _flip(self) -> None:
         card = self.exercise.flip()
         if card:
+            self._attempt_state.mark_support("reveal")
             self._update_view(card)
 
     def _update_view(self, card) -> None:
@@ -1270,10 +1534,16 @@ class FlipCardTab(KeyboardNavigableTab):
     def _mark_result(self, knew: bool) -> None:
         self.exercise.mark_known(knew)
         card = self.exercise.current_card
-        if card and not knew:
-            self._on_attempt(False, card.french, card.english, "")
-        elif card and knew:
-            self._on_attempt(True, card.french, card.english, "")
+        if card:
+            evidence = self._attempt_state.resolve("correct" if knew else "incorrect")
+            if evidence is not None:
+                first_try, support_used, first_try_correct, answer = evidence
+                self._on_resolution(AttemptResolution(
+                    language=active_language_key(), exercise_id="flip_card", skill="card_recall",
+                    direction="self_rating", item_id=card.id, outcome="correct" if knew else "incorrect",
+                    first_try=first_try, support_used=support_used, answer=answer,
+                    first_try_correct=first_try_correct, prompt=card.french, correct_answer=card.english,
+                ))
         self.stats.update_state(self.exercise.state.accuracy, self.exercise.state.current_streak)
         self._next_card()
 
@@ -1290,7 +1560,7 @@ class ReviewTab(KeyboardNavigableTab):
         self,
         master: tk.Misc,
         items: list[ReviewItem],
-        on_attempt: Callable[[bool, str | None, str | None, str | None], None],
+        on_attempt: Callable[[ReviewItem, str, bool], None],
     ) -> None:
         super().__init__(master, padding=12)
         self._items = items
@@ -1410,7 +1680,7 @@ class ReviewTab(KeyboardNavigableTab):
             self.feedback_var.set("Pick an answer first.")
             return
         correct = choice == item.correct_answer
-        self._on_attempt(correct, item.prompt, item.correct_answer, choice, item.exercise)
+        self._on_attempt(item, choice, correct)
         self.feedback_var.set("Correct!" if correct else f"Not quite. Correct answer: {item.correct_answer}")
         self._index += 1
         self.after(650, self._load_current)
@@ -1500,13 +1770,19 @@ class LangPracticeApp(tk.Tk):
             exercise = self.registry.create(name)
             host = ScrollableTabHost(self.notebook)
             if isinstance(exercise, FlashcardExercise):
-                tab = FlashcardTab(host.canvas, exercise, self._on_attempt, self.help_panel)
+                tab = FlashcardTab(host.canvas, exercise, self._record_resolution, self.help_panel)
             elif isinstance(exercise, SentencePracticeExercise):
-                tab = SentencePracticeTab(host.canvas, exercise, self._on_attempt, self.help_panel)
+                tab = SentencePracticeTab(
+                    host.canvas,
+                    exercise,
+                    self._record_resolution,
+                    self.help_panel,
+                    self._sentence_readiness_snapshots,
+                )
             elif isinstance(exercise, FlipCardExercise):
-                tab = FlipCardTab(host.canvas, exercise, self._on_attempt, self.help_panel)
+                tab = FlipCardTab(host.canvas, exercise, self._record_resolution, self.help_panel)
             elif isinstance(exercise, ConjugationExercise):
-                tab = ConjugationTab(host.canvas, exercise, self._on_attempt, self.help_panel)
+                tab = ConjugationTab(host.canvas, exercise, self._record_resolution, self.help_panel)
             else:
                 continue
             host.set_content(tab)
@@ -1521,26 +1797,59 @@ class LangPracticeApp(tk.Tk):
     def _load_review_items(self) -> list[ReviewItem]:
         return self.review_db.due_items(language=active_language_key())
 
+    def _sentence_readiness_snapshots(self, sentence: Sentence) -> dict[TargetKey, ReadinessSnapshot]:
+        """Load only the explicit target evidence authored for this sentence."""
+
+        language = sentence.language or active_language_key()
+        return {
+            key: self.review_db.readiness_snapshot(
+                language=language, skill=key[0], direction=key[1], item_id=key[2]
+            )
+            for key in sentence_target_keys(sentence)
+        }
+
     def _on_attempt(
         self,
+        item: ReviewItem,
+        user_answer: str,
         correct: bool,
-        prompt: str | None,
-        correct_answer: str | None,
-        user_answer: str | None,
-        exercise_name: str | None = None,
     ) -> None:
         self.session_metrics.register_attempt(correct)
-        if prompt and correct_answer is not None and user_answer is not None:
-            self.review_db.record_attempt(
-                language=active_language_key(),
-                exercise=exercise_name or self._active_exercise_name(),
-                prompt=prompt,
-                correct_answer=correct_answer,
-                user_answer=user_answer,
-                correct=correct,
+        self.review_db.resolve_review_item(item, user_answer=user_answer, correct=correct)
+        footer = self.__dict__.get("session_footer")
+        if footer:
+            footer.refresh()
+
+    def _record_resolution(self, resolution: AttemptResolution) -> None:
+        """Turn one guarded focused-practice resolution into durable evidence."""
+
+        event = AttemptEvent(
+            event_id=uuid4().hex,
+            occurred_at=datetime.now(timezone.utc),
+            session_id=self.session_id,
+            language=resolution.language,
+            exercise_id=resolution.exercise_id,
+            skill=resolution.skill,
+            direction=resolution.direction,
+            item_id=resolution.item_id,
+            outcome=resolution.outcome,
+            first_try=resolution.first_try,
+            support_used=resolution.support_used,
+            answer=resolution.answer,
+            first_try_correct=resolution.first_try_correct,
+        )
+        stored = self.review_db.record_event(
+            event, prompt=resolution.prompt, correct_answer=resolution.correct_answer
+        )
+        if stored:
+            # A resolution is the meaningful unit in the session recap. A
+            # helped/revealed response is intentionally not shown as correct.
+            self.session_metrics.register_attempt(
+                resolution.outcome == "correct" and not resolution.support_used
             )
-        if getattr(self, "session_footer", None):
-            self.session_footer.refresh()
+        footer = self.__dict__.get("session_footer")
+        if footer:
+            footer.refresh()
 
     def _active_exercise_name(self) -> str:
         if not self.notebook:
