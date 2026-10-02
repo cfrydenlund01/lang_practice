@@ -9,7 +9,6 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence
 import unicodedata
 
 from .data import random_conjugation_pattern, random_vocabulary_item, sentences, vocabulary_items
-from .language_registry import active_language_key
 from .models import ConjugationPattern, Sentence, VocabularyItem
 from .sentence_generator import generate_sentence
 
@@ -65,6 +64,52 @@ class ExerciseState:
         if self.total_attempts == 0:
             return 0.0
         return self.correct_attempts / self.total_attempts
+
+
+@dataclass
+class PromptAttemptState:
+    """Track one displayed prompt until it has one durable resolution.
+
+    Incorrect checks deliberately remain retryable.  They are folded into the
+    eventual correct/reveal/skip resolution so a learner cannot accidentally
+    create several history events by pressing Check repeatedly.
+    """
+
+    support_used: set[str] = field(default_factory=set)
+    first_try_correct: bool | None = None
+    answer_count: int = 0
+    last_answer: str | None = None
+    resolved: bool = False
+
+    def mark_support(self, support: str) -> None:
+        if support not in {"hint", "reveal"}:
+            raise ValueError(f"Unknown support: {support}")
+        if not self.resolved:
+            self.support_used.add(support)
+
+    def note_answer(self, answer: str, correct: bool) -> None:
+        if self.resolved:
+            return
+        self.answer_count += 1
+        self.last_answer = answer
+        if self.first_try_correct is None:
+            self.first_try_correct = correct
+
+    def resolve(self, outcome: str, answer: str | None = None) -> tuple[bool, frozenset[str], bool | None, str | None] | None:
+        """Return evidence for one resolution, or ``None`` if already stored."""
+
+        if self.resolved:
+            return None
+        if outcome not in {"correct", "incorrect", "skipped"}:
+            raise ValueError(f"Unknown outcome: {outcome}")
+        self.resolved = True
+        final_answer = answer if answer is not None else self.last_answer
+        return (
+            self.answer_count == 1,
+            frozenset(self.support_used),
+            self.first_try_correct,
+            final_answer,
+        )
 
 
 @dataclass(frozen=True)
@@ -164,10 +209,9 @@ class FlipCardExercise:
 
     def refresh_deck(self) -> None:
         category_filter = None if not self.category or self.category == "all" else self.category
-        language = active_language_key()
         vocab_cards = [
             Card(
-                id=f"{language}_vocab_{item.french}",
+                id=item.id,
                 french=item.french,
                 english=item.english,
                 ipa=item.ipa,
